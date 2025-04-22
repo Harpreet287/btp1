@@ -257,6 +257,7 @@ obstacles = [
 
 # Initialize drones with different colors
 colors = ['blue', 'orange', 'green', 'purple', 'red', 'cyan']
+
 drones = [
     Drone(start=[0, 0], goal=[12, 10], color=colors[0]),
     Drone(start=[10, 0], goal=[2, 10], color=colors[1]),
