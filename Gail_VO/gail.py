@@ -1,98 +1,86 @@
-import airsim
+# gail.py
 import gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import airsim
 from torch.distributions import Normal
 
-# === Environment wrapper ===
 class MultiUAVEnv(gym.Env):
     def __init__(self, num_uavs=3):
         super().__init__()
         self.num_uavs = num_uavs
         self.client = airsim.MultirotorClient()
         self.client.confirmConnection()
-        obs_dim = num_uavs * 6  # [x,y,z,vx,vy,vz] per UAV
-        act_dim = num_uavs * 3  # acceleration commands per UAV
+        # each UAV: x,y,z,vx,vy,vz + goal x,y,z
+        obs_dim = num_uavs*(6 + 3)
+        act_dim = num_uavs*3
         self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
-        self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(act_dim,), dtype=np.float32)
+        self.action_space = gym.spaces.Box(-1,1,shape=(act_dim,),dtype=np.float32)
+        self.goals = [np.array([10,10,-2]), np.array([0,10,-2]), np.array([5,15,-2])]
 
     def reset(self):
         self.client.reset()
-        return self._get_obs()
+        st = self._get_state()
+        return np.concatenate([st] + [g for g in self.goals])
 
     def step(self, action):
         for i in range(self.num_uavs):
-            idx = slice(3*i, 3*(i+1))
-            cmd = airsim.Vector3r(*action[idx])
-            self.client.moveByVelocityAsync(cmd.x_val, cmd.y_val, cmd.z_val,
-                                            duration=0.1, vehicle_name=f"UAV{i}")
+            vx,vy,vz = action[3*i:3*i+3]
+            self.client.moveByVelocityAsync(vx,vy,vz,duration=0.1, vehicle_name=f"UAV{i}")
         self.client.simPause(False)
         airsim.time.sleep(0.1)
         self.client.simPause(True)
-        obs = self._get_obs()
-        # reward is provided by discriminator externally
+        st = self._get_state()
+        obs = np.concatenate([st] + [g for g in self.goals])
         return obs, 0.0, False, {}
 
-    def _get_obs(self):
-        states = []
+    def _get_state(self):
+        s=[]
         for i in range(self.num_uavs):
-            s = self.client.getMultirotorState(vehicle_name=f"UAV{i}")
-            p = s.kinematics_estimated.position
-            v = s.kinematics_estimated.linear_velocity
-            states += [p.x_val, p.y_val, p.z_val, v.x_val, v.y_val, v.z_val]
-        return np.array(states, dtype=np.float32)
+            m = self.client.getMultirotorState(vehicle_name=f"UAV{i}")
+            p = m.kinematics_estimated.position
+            v = m.kinematics_estimated.linear_velocity
+            s += [p.x_val, p.y_val, p.z_val, v.x_val, v.y_val, v.z_val]
+        return np.array(s, dtype=np.float32)
 
-# === Networks with value head for PPO ===
 class PolicyNet(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden=[256,256]):
+    def __init__(self, obs_dim, act_dim):
         super().__init__()
-        layers = []
-        prev = obs_dim
-        for h in hidden:
-            layers += [nn.Linear(prev, h), nn.ReLU()]
-            prev = h
-        self.net = nn.Sequential(*layers)
-        self.mu_layer = nn.Linear(prev, act_dim)
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim,256), nn.ReLU(),
+            nn.Linear(256,256), nn.ReLU(),
+        )
+        self.mu = nn.Linear(256,act_dim)
         self.logstd = nn.Parameter(torch.zeros(act_dim))
-        self.value_layer = nn.Linear(prev, 1)
-
-    def forward(self, x):
-        h = self.net(x)
-        mu = self.mu_layer(h)
-        std = torch.exp(self.logstd)
-        value = self.value_layer(h).squeeze(-1)
-        return mu, std, value
+        self.v = nn.Linear(256,1)
+    def forward(self,x):
+        h=self.net(x)
+        return self.mu(h), torch.exp(self.logstd), self.v(h).squeeze(-1)
 
 class Discriminator(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden=[256,256]):
+    def __init__(self, obs_dim,act_dim):
         super().__init__()
-        layers = []
-        prev = obs_dim + act_dim
-        for h in hidden:
-            layers += [nn.Linear(prev, h), nn.ReLU()]
-            prev = h
-        layers += [nn.Linear(prev, 1), nn.Sigmoid()]
-        self.net = nn.Sequential(*layers)
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim+act_dim,256), nn.ReLU(),
+            nn.Linear(256,256), nn.ReLU(),
+            nn.Linear(256,1), nn.Sigmoid()
+        )
+    def forward(self,o,a): return self.net(torch.cat([o,a],-1))
 
-    def forward(self, obs, act):
-        x = torch.cat([obs, act], dim=-1)
-        return self.net(x)
-
-# === Load expert dataset ===
+# load expert
 data = np.load('expert.npz')
-expert_obs = torch.tensor(data['obs'], dtype=torch.float32)
-expert_act = torch.tensor(data['acts'], dtype=torch.float32)
+expert_obs = torch.tensor(data['obs'],dtype=torch.float32)
+expert_act = torch.tensor(data['acts'],dtype=torch.float32)
 
-# === Initialize environment, models, and optimizers ===
-env = MultiUAVEnv(num_uavs=3)
+# init
+env = MultiUAVEnv()
 obs_dim = env.observation_space.shape[0]
 act_dim = env.action_space.shape[0]
-policy = PolicyNet(obs_dim, act_dim)
-disc = Discriminator(obs_dim, act_dim)
-policy_opt = optim.Adam(policy.parameters(), lr=3e-4)
-disc_opt   = optim.Adam(disc.parameters(), lr=3e-4)
+policy = PolicyNet(obs_dim,act_dim)
+disc = Discriminator(obs_dim,act_dim)
+policy_opt, disc_opt = optim.Adam(policy.parameters(),3e-4), optim.Adam(disc.parameters(),3e-4)
 
 # === PPO hyperparameters ===
 gamma = 0.99
@@ -108,7 +96,9 @@ max_grad_norm = 0.5
 def collect_trajectories(env, policy, steps=2048):
     buf = {k:[] for k in ['obs','acts','logps','vals','rews','dones']}
     obs = env.reset()
+    print(steps)
     for _ in range(steps):
+        print(_)
         obs_t = torch.tensor(obs, dtype=torch.float32)
         mu, std, val = policy(obs_t)
         dist = Normal(mu, std)
@@ -147,7 +137,9 @@ def compute_gae(buf, disc):
     return adv, returns
 
 # === GAIL + PPO training loop ===
-for iteration in range(1000):
+for iteration in range(100):
+    print('iteration')
+    print(iteration)
     # 1) Collect trajectories
     buf = collect_trajectories(env, policy)
     adv, returns = compute_gae(buf, disc)
@@ -156,6 +148,7 @@ for iteration in range(1000):
     obs_buf = torch.tensor(buf['obs'], dtype=torch.float32)
     act_buf = torch.tensor(buf['acts'], dtype=torch.float32)
     for _ in range(5):
+        print(_)
         idx_p = np.random.randint(0, len(obs_buf), size=batch_size)
         idx_e = np.random.randint(0, len(expert_obs), size=batch_size)
         d_p = disc(obs_buf[idx_p], act_buf[idx_p])
@@ -176,8 +169,10 @@ for iteration in range(1000):
 
     for _ in range(ppo_epochs):
         idxs = np.random.permutation(len(adv_t))
-        for start in range(0, len(ad
-        vs_t), batch_size):
+        print(batch_size)
+        print(len(adv_t))
+        for start in range(0, len(adv_t), batch_size):
+            print(start)
             mb = idxs[start:start+batch_size]
             mb_obs = obs_t[mb]
             mb_acts = acts_t[mb]
@@ -204,6 +199,22 @@ for iteration in range(1000):
 
     print(f"Iter {iteration} | D_loss {loss_d.item():.3f} | P_loss {policy_loss.item():.3f}")
 
-# Save models
-torch.save(policy.state_dict(), 'policy.pth')
-torch.save(disc.state_dict(), 'disc.pth')
+torch.save(policy.state_dict(),'policy.pth')
+torch.save(disc.state_dict(),'disc.pth')
+
+
+
+
+# {
+#   "SettingsVersion": 1.2,
+#   "SimMode": "Multirotor",
+#   "RpcPort": 41451,
+#   "LocalHostIp": "192.168.244.207",
+#   "ViewMode": "Manual",
+#   "RpcEnabled": true,
+#   "Vehicles": {
+#     "UAV0": {"VehicleType": "SimpleFlight","AutoCreate": true,"DefaultVehicleState": "Inactive","X": 0, "Y": 0, "Z": -2,"EnableCollisionPassthrough": false},
+#     "UAV1": {"VehicleType": "SimpleFlight","AutoCreate": true,"DefaultVehicleState": "Inactive","X": 10, "Y": 0, "Z": -2,"EnableCollisionPassthrough": false},
+#     "UAV2": {"VehicleType": "SimpleFlight","AutoCreate": true,"DefaultVehicleState": "Inactive","X": 5, "Y": 5, "Z": -300,"EnableCollisionPassthrough": false}
+#   }
+# }
